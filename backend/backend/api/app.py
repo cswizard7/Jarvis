@@ -9,23 +9,6 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pandas as pd
 from ml.predictor import predict_stress_from_tracker
-from dotenv import load_dotenv
-import re
-import json
-
-env_path = os.path.join(os.path.dirname(__file__), '.env')
-load_dotenv(env_path)
-
-GEMINI_AVAILABLE = False
-try:
-    import google.generativeai as genai
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-    
-    if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
-        genai.configure(api_key=GEMINI_API_KEY)
-        GEMINI_AVAILABLE = True
-except ImportError:
-    pass
 
 app = Flask(__name__)
 CORS(app)
@@ -38,10 +21,14 @@ DISTRACTING = ["YouTube", "Instagram", "Netflix", "Twitter", "TikTok", "Facebook
 def load_log():
     if not os.path.exists(LOG_FILE):
         return None
-    df = pd.read_csv(LOG_FILE, encoding='utf-8', encoding_errors='ignore')
+    df = pd.read_csv(LOG_FILE, encoding='utf-8', encoding_errors='ignore', usecols=['timestamp', 'app', 'duration_seconds'])
     if df.empty:
         return None
     df["timestamp"] = pd.to_datetime(df["timestamp"], format='mixed')
+    if "source" not in df.columns:
+        df["source"] = "pc"
+    else:
+        df["source"] = df["source"].fillna("pc")
     return df
 
 
@@ -54,8 +41,14 @@ def extract_base_app(title: str) -> str:
 
 def compute_features_for_group(group: pd.DataFrame):
     group = group.sort_values("timestamp")
+
+    pc_group = group[group["source"] == "pc"]
+    phone_group = group[group["source"] == "phone"]
+
     total_entries = len(group)
     screen_time = total_entries * 5 / 60
+    pc_screen_time = len(pc_group) * 5 / 60
+    phone_screen_time = len(phone_group) * 5 / 60
 
     night = group[group["timestamp"].dt.hour >= 22]
     night_usage = len(night) * 5 / 60
@@ -75,7 +68,10 @@ def compute_features_for_group(group: pd.DataFrame):
 
     group["base_app"] = group["app"].apply(extract_base_app)
     group["prev_base_app"] = group["base_app"].shift(1).fillna(group["base_app"])
-    app_switches = int((group["base_app"] != group["prev_base_app"]).sum())
+    raw_switches = int((group["base_app"] != group["prev_base_app"]).sum())
+    # FIX: Cap at 1 switch per 2 minutes to filter noise from tab/file changes
+    max_reasonable = max(1, int(len(group) * 5 / 120))
+    app_switches = min(raw_switches, max_reasonable)
 
     breaks = int((group["gap"] > 300).sum())
 
@@ -86,6 +82,8 @@ def compute_features_for_group(group: pd.DataFrame):
 
     return {
         "screen_time": round(screen_time, 2),
+        "pc_screen_time": round(pc_screen_time, 2),
+        "phone_screen_time": round(phone_screen_time, 2),
         "continuous_usage": round(continuous_usage, 2),
         "night_usage": round(night_usage, 2),
         "app_switches": app_switches,
@@ -110,11 +108,15 @@ def compute_wellness_score(features, stress_level):
     stress_penalty = {"High": 40, "Medium": 20, "Low": 0}
     score -= stress_penalty.get(stress_level, 20)
 
-    screen_time = features["screen_time"]
-    if screen_time > 4:
-        score -= min(20, (screen_time - 4) * 5)
+    # FIX: screen_time is in MINUTES. Convert to hours for threshold comparisons.
+    screen_hours = features["screen_time"] / 60
+    if screen_hours > 4:
+        score -= min(20, (screen_hours - 4) * 5)
 
-    score -= min(15, features["night_usage"] * 10)
+    # FIX: night_usage is in MINUTES. Old code did night_usage * 10 treating
+    # it as hours, so 3 min of night use = 30 point penalty. 
+    # Correct: penalise per 10 minutes of night usage, max 15 points.
+    score -= min(15, (features["night_usage"] / 10) * 3)
     score += features["productive_ratio"] * 10
     score += min(5, features["breaks"] * 1.5)
 
@@ -165,7 +167,7 @@ def get_stress():
 
 
 @app.route("/api/features", methods=["GET"])
-def features():
+def get_features():
     data = compute_features()
     if data is None:
         return jsonify({"error": "No activity data yet for today."}), 400
@@ -181,6 +183,8 @@ def wellness():
             "stress_level": "Low",
             "screen_time_minutes": 0,
             "screen_time_hours": 0.0,
+            "pc_screen_time": 0.0,
+            "phone_screen_time": 0.0,
             "message": "No data yet — start tracker.py"
         })
 
@@ -191,18 +195,23 @@ def wellness():
     )
 
     wellness_score = compute_wellness_score(features, stress_level)
-    screen_minutes = int(features["screen_time"])
+    # FIX: screen_time is already in MINUTES — no * 60 needed
+    screen_minutes = round(features["screen_time"])
     screen_hours = round(features["screen_time"] / 60, 2)
+    disp_h = screen_minutes // 60
+    disp_m = screen_minutes % 60
 
     return jsonify({
         "wellness_score": wellness_score,
         "stress_level": stress_level,
         "screen_time_minutes": screen_minutes,
         "screen_time_hours": screen_hours,
+        "pc_screen_time": features["pc_screen_time"],
+        "phone_screen_time": features["phone_screen_time"],
         "productive_ratio": features["productive_ratio"],
         "breaks": features["breaks"],
         "night_usage": features["night_usage"],
-        "message": f"{screen_minutes // 60}h {screen_minutes % 60}m of screen time today"
+        "message": f"{disp_h}h {disp_m}m of screen time today"
     })
 
 
@@ -233,7 +242,9 @@ def history():
             "date": str(day),
             "name": day.strftime("%b %d"),
             "screen_time": f["screen_time"],
-            "screen_time_minutes": round(f["screen_time"] * 60),
+            "screen_time_minutes": round(f["screen_time"]),  # already minutes
+            "pc_screen_time": f["pc_screen_time"],
+            "phone_screen_time": f["phone_screen_time"],
             "productive": round(f["screen_time"] * f["productive_ratio"], 2),
             "entertainment": round(f["screen_time"] * (1 - f["productive_ratio"]), 2),
             "stress": stress_value,
@@ -274,17 +285,9 @@ def heatmap():
     return jsonify(result)
 
 
-@app.route("/api/status", methods=["GET"])
-def status():
-    return jsonify({"status": "Backend running"})
-
-
 @app.route("/api/alerts", methods=["GET"])
 def get_alerts():
     features = compute_features()
-    alerts = []
-    hour = datetime.now().hour
-
     if features is None:
         return jsonify([])
 
@@ -294,93 +297,132 @@ def get_alerts():
         features["breaks"], features["productive_ratio"]
     )
     wellness = compute_wellness_score(features, stress_level)
-    screen_mins = int(features["screen_time"])
+    # FIX: screen_time is in MINUTES (total_entries * 5 / 60).
+    # Old code used screen_mins = screen_time * 60 (wrong — that gives seconds)
+    # and checked screen_time >= 6/4/2 treating minutes as hours,
+    # so 7 minutes of tracking triggered the "6 Hours on Screen" alert.
+    screen_mins = round(features["screen_time"])          # already minutes
+    screen_hours = features["screen_time"] / 60          # convert to hours for thresholds
+    hour = datetime.now().hour
+    result = []
+
+    # FIX: Don't fire any alerts until there's at least 15 minutes of data
+    if screen_mins < 15:
+        return jsonify([])
+
+    def fmt(m):
+        """Format minutes as Xh Ym or Ym."""
+        m = round(m)
+        return f"{m // 60}h {m % 60}m" if m >= 60 else f"{m}m"
 
     if stress_level == "High":
-        alerts.append({
+        result.append({
             "id": "stress_high", "type": "danger",
             "title": "Stress Spike Detected 🔴",
             "message": "Digital fatigue is critical. Close some tabs and step away.",
             "action": "Take a 5-min break"
         })
     elif stress_level == "Medium":
-        alerts.append({
+        result.append({
             "id": "stress_medium", "type": "warning",
             "title": "Fatigue Building Up ⚠️",
             "message": "Stress is climbing steadily. Your brain needs a breather.",
             "action": "Stretch for 2 mins"
         })
 
-    if screen_mins >= 45 and features["breaks"] == 0:
-        alerts.append({
-            "id": "break_overdue", "type": "warning",
-            "title": "Break Overdue 🪑",
-            "message": f"{screen_mins} minutes of continuous screen time with zero breaks.",
-            "action": "Stand up & stretch now"
+    if features["continuous_usage"] >= 90:
+        result.append({
+            "id": "continuous_usage_danger", "type": "danger",
+            "title": "Long Unbroken Session 😵",
+            "message": f"{fmt(features['continuous_usage'])} without a real break. Eye strain risk.",
+            "action": "Step away for 5 minutes"
+        })
+    elif features["continuous_usage"] >= 45:
+        result.append({
+            "id": "continuous_usage_warning", "type": "warning",
+            "title": "Take a Break Soon 🪑",
+            "message": f"{fmt(features['continuous_usage'])} of continuous usage.",
+            "action": "Try the 20-20-20 rule"
         })
 
-    if screen_mins >= 360:
-        alerts.append({
+    # FIX: Use screen_hours (not screen_time which is minutes) for hour-based thresholds
+    if screen_hours >= 6:
+        result.append({
             "id": "screentime_6h", "type": "danger",
             "title": "6 Hours on Screen 😵",
-            "message": "You have been at this for 6 hours today. Serious eye strain risk.",
+            "message": f"{fmt(features['screen_time'])} on screen today. Serious eye strain risk.",
             "action": "20-20-20 rule: look 20ft away for 20 sec"
         })
-    elif screen_mins >= 240:
-        alerts.append({
+    elif screen_hours >= 4:
+        result.append({
             "id": "screentime_4h", "type": "warning",
             "title": "4 Hour Mark Crossed ⏱️",
-            "message": "You have hit 4 hours of screen time. Go outside for 10 mins.",
+            "message": f"{fmt(features['screen_time'])} of screen time. Go outside for 10 mins.",
             "action": "Touch some grass 🌿"
         })
-    elif screen_mins >= 120:
-        alerts.append({
+    elif screen_hours >= 2:
+        result.append({
             "id": "screentime_2h", "type": "info",
             "title": "Hydration Check 💧",
-            "message": "2 hours in. When did you last drink water?",
+            "message": f"{fmt(features['screen_time'])} in. When did you last drink water?",
             "action": "Grab a glass of water"
         })
 
-    if hour >= 22 and features["night_usage"] > 0:
-        alerts.append({
+    if features["night_usage"] >= 45:
+        result.append({
+            "id": "night_usage_danger", "type": "danger",
+            "title": "Heavy Late Night Usage 🌙",
+            "message": f"{fmt(features['night_usage'])} on devices after 10 PM. Sleep quality at risk.",
+            "action": "Put devices down 30 min before bed"
+        })
+    elif hour >= 22 and features["night_usage"] > 0:
+        result.append({
             "id": "night_owl", "type": "info",
             "title": "Night Owl Alert 🌙",
             "message": "Late-night screen use crushes sleep quality and next-day focus.",
             "action": "Wind down in 30 mins"
         })
 
-    if features["productive_ratio"] < 0.3:
-        alerts.append({
+    # FIX: Only fire productivity alert with 30+ mins of data to avoid
+    # false positives from a single YouTube video at session start
+    if screen_mins >= 30 and features["productive_ratio"] < 0.3:
+        result.append({
             "id": "distraction_mode", "type": "warning",
             "title": "Distraction Mode: ON 📵",
             "message": "Over 70% of your time is on YouTube / Instagram / Netflix.",
             "action": "25-min Pomodoro sprint"
         })
 
+    if features["phone_screen_time"] >= 120:
+        result.append({
+            "id": "phone_heavy", "type": "warning",
+            "title": "Heavy Phone Usage 📱",
+            "message": f"{fmt(features['phone_screen_time'])} on phone today.",
+            "action": "Consider a phone-free hour"
+        })
+
     if wellness < 40:
-        alerts.append({
+        result.append({
             "id": "wellness_critical", "type": "danger",
             "title": "Wellness Critical 🚨",
             "message": f"Your wellness score dropped to {wellness}. Jarvis recommends a hard stop.",
             "action": "Close laptop for 15 mins"
         })
 
-    if wellness >= 85 and stress_level == "Low" and screen_mins > 30:
-        alerts.append({
+    # FIX: Use screen_mins (minutes) not screen_mins (was seconds) for the > 30 check
+    if wellness >= 85 and stress_level == "Low" and screen_mins >= 30:
+        result.append({
             "id": "crushing_it", "type": "success",
             "title": "You're Crushing It 🎯",
             "message": f"Wellness at {wellness}, stress low, great balance. Keep it up.",
             "action": None
         })
 
-    return jsonify(alerts)
+    return jsonify(result)
 
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    if not GEMINI_AVAILABLE:
-        return jsonify({"reply": "Gemini API not configured. Please check the backend .env file."}), 503
-
     data = request.json
     user_message = data.get("message", "").lower()
 
@@ -394,113 +436,95 @@ def chat():
         features["breaks"], features["productive_ratio"]
     )
     wellness = compute_wellness_score(features, stress_level)
-    screen_mins = int(features["screen_time"])
-    hours = screen_mins // 60
-    mins = screen_mins % 60
+    # FIX: screen_time is in MINUTES. Old code did screen_time * 60 (giving seconds),
+    # then hours = seconds // 60 (giving back original minutes as "hours").
+    # So 45 min -> screen_mins=2700 -> hours=45 -> showed "45h 0m".
+    # Fix: screen_time is already minutes, just split it directly.
+    screen_mins = round(features["screen_time"])          # already minutes
+    hours = screen_mins // 60                             # real hours
+    mins = screen_mins % 60                               # remaining minutes
     prod_ratio = round(features["productive_ratio"] * 100)
     break_count = features["breaks"]
+    # FIX: phone_screen_time is also in minutes, not hours — no * 60 needed
+    phone_mins = round(features["phone_screen_time"])
+    # screen_hours for threshold comparisons
+    screen_hours = features["screen_time"] / 60
 
-    system_prompt = f"""You are Jarvis, a personal, friendly, and analytical AI digital wellness assistant. 
-Keep your responses concise (1-3 sentences max) and conversational. Do not use markdown (no bullet points or bold text) because the frontend renders plain text.
+    def fmt(m):
+        m = round(m)
+        return f"{m // 60}h {m % 60}m" if m >= 60 else f"{m}m"
 
-Here is the user's current data for today:
-- Screen Time: {hours}h {mins}m
-- Wellness Score: {wellness}/100 
-- Stress Level Prediction: {stress_level}
-- Productive focus ratio: {prod_ratio}% 
-- Breaks taken today: {break_count}
+    if any(w in user_message for w in ["how was", "my day", "summary", "overall"]):
+        if stress_level == "Low":
+            tail = "Not bad at all — keep it up!"
+        elif stress_level == "Medium":
+            tail = "Worth taking a proper break soon."
+        else:
+            tail = "Seriously, close the laptop for 15 mins."
+        reply = f"You have clocked {fmt(features['screen_time'])} of screen time with a wellness score of {wellness}/100. Stress is sitting at {stress_level.lower()} — {tail}"
 
-Analyze this context and respond directly to what the user asks."""
+    elif any(w in user_message for w in ["stress", "burnout", "tired", "burning"]):
+        if stress_level == "Low":
+            reply = f"Your stress is low right now. You are in good shape — productive ratio is {prod_ratio}% which is solid."
+        else:
+            break_msg = "decent." if break_count >= 2 else "not enough. Step away for 5 mins."
+            reply = f"Your stress is {stress_level.lower()} right now. You have had {break_count} breaks today — that is {break_msg}"
 
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content([
-            system_prompt,
-            f"User says: {user_message}"
-        ])
-        reply = response.text.strip()
-    except Exception as e:
-        reply = f"Sorry, I had trouble thinking about that. Error: {str(e)}"
+    elif any(w in user_message for w in ["focus", "productive", "productivity"]):
+        if prod_ratio >= 70:
+            tail = "Solid focus — keep riding that wave."
+        elif prod_ratio >= 40:
+            tail = f"About {100 - prod_ratio}% of your time went to distracting apps. A Pomodoro sprint might help."
+        else:
+            tail = "Majority of screen time has been on distracting apps today. Time to lock in."
+        reply = f"Your productive ratio is {prod_ratio}% today. {tail}"
+
+    elif any(w in user_message for w in ["break", "rest", "stop", "should i"]):
+        if break_count >= 3:
+            tail = "You are pacing yourself well."
+        else:
+            tail = "That is on the low side — stand up, stretch, grab water. Your brain will thank you."
+        reply = f"You have taken {break_count} breaks over {fmt(features['screen_time'])}. {tail}"
+
+    elif any(w in user_message for w in ["screen time", "how long", "hours"]):
+        # FIX: use screen_hours for threshold comparisons, not raw screen_time (minutes)
+        if screen_hours < 4:
+            tail = "That is within healthy range — nice."
+        elif screen_hours < 6:
+            tail = "That is getting up there. Try to cap it soon."
+        else:
+            tail = "That is a long day. Seriously consider wrapping up."
+        reply = f"You have been on screen for {fmt(features['screen_time'])} today. {tail}"
+
+    elif any(w in user_message for w in ["phone", "mobile", "instagram", "youtube"]):
+        reply = f"Your phone has been tracked too — {fmt(features['phone_screen_time'])} today via ADB. That feeds directly into your wellness score of {wellness}/100."
+
+    elif any(w in user_message for w in ["fix", "improve", "tomorrow", "better"]):
+        tips = []
+        if break_count < 2:
+            tips.append("take more breaks — at least one every 45 mins")
+        if features["productive_ratio"] < 0.6:
+            tips.append("cut down on YouTube and Instagram during work hours")
+        # FIX: use screen_hours for the > 5 hour threshold
+        if screen_hours > 5:
+            tips.append("set a hard stop time for screens")
+        if not tips:
+            tips.append("honestly not much — you had a solid day")
+        reply = "Tomorrow, focus on: " + ", and ".join(tips) + "."
+
+    elif any(w in user_message for w in ["hi", "hello", "hey"]):
+        reply = f"Hey! Wellness at {wellness}/100, stress is {stress_level.lower()}. What do you want to know about your day?"
+
+    else:
+        reply = f"Right now: {fmt(features['screen_time'])} screen time, wellness score {wellness}/100, stress {stress_level.lower()}. Ask me about your focus, breaks, stress, or what to fix tomorrow."
 
     return jsonify({"reply": reply})
 
-@app.route("/api/analyze-screenshot", methods=["POST"])
-def analyze_screenshot():
-    if not GEMINI_AVAILABLE:
-        return jsonify({
-            "error": "Gemini API not configured. Please set GEMINI_API_KEY in .env and install google-generativeai."
-        }), 503
 
-    if 'image' not in request.files:
-        return jsonify({"error": "No image file provided. Send a multipart/form-data request with field 'image'."}), 400
+@app.route("/api/status", methods=["GET"])
+def status():
+    return jsonify({"status": "Backend running"})
 
-    image_file = request.files['image']
-    if image_file.filename == '':
-        return jsonify({"error": "Empty filename."}), 400
-
-    image_bytes = image_file.read()
-    mime_type = image_file.content_type or 'image/png'
-
-    PROMPT = """You are a digital wellness expert analyzing a phone's Digital Wellbeing or Screen Time screenshot.
-
-Extract the following information from this screenshot and respond with ONLY a valid JSON object (no markdown, no code blocks):
-
-{
-  "summary": "A 2-3 sentence personalized analysis of the user's phone habits based on what you see.",
-  "total_screen_time": "Total screen time as shown (e.g. '4h 32m'). If not visible, estimate from the app totals.",
-  "dominant_category": "The category that took the most time (Social, Entertainment, Productivity, Communication, Gaming, Education, Health, or Other)",
-  "wellness_score": <integer 0-100, where 100 is excellent digital health and 0 is poor>,
-  "apps": [
-    {
-      "name": "App name",
-      "time": "Time as shown (e.g. '1h 20m')",
-      "minutes": <integer total minutes>,
-      "category": "One of: Social, Entertainment, Productivity, Communication, Gaming, Education, Health, Other"
-    }
-  ],
-  "recommendations": [
-    "Specific actionable recommendation 1 based on the data",
-    "Specific actionable recommendation 2",
-    "Specific actionable recommendation 3"
-  ]
-}
-
-Important:
-- Include all apps visible in the screenshot.
-- Be specific and personal in the summary and recommendations — reference the actual apps and times.
-- The wellness_score should be lower if there's heavy social media, late-night usage, or excessive screen time.
-- Return ONLY the JSON object. No other text."""
-
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-
-        response = model.generate_content([
-            PROMPT,
-            {"mime_type": mime_type, "data": image_bytes},
-        ])
-
-        raw = response.text.strip()
-        # Strip any accidental markdown fences
-        raw = re.sub(r'^```json\s*', '', raw)
-        raw = re.sub(r'^```\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw)
-
-        result = json.loads(raw)
-
-        # Ensure required fields exist with defaults
-        result.setdefault("summary", "Analysis complete.")
-        result.setdefault("total_screen_time", "Unknown")
-        result.setdefault("dominant_category", "Other")
-        result.setdefault("wellness_score", 50)
-        result.setdefault("apps", [])
-        result.setdefault("recommendations", [])
-
-        return jsonify(result)
-
-    except json.JSONDecodeError as e:
-        return jsonify({"error": f"Could not parse Gemini response as JSON: {str(e)}. Raw: {raw[:200]}"}), 500
-    except Exception as e:
-        return jsonify({"error": f"Gemini API error: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

@@ -28,7 +28,7 @@ export default function Sidebar() {
         <div className="p-2 bg-[#4F46E5]/20 rounded-xl">
           <Activity className="w-6 h-6 text-[#4F46E5]" />
         </div>
-        <h1 className="text-xl font-bold tracking-tight">Digital Wellness AI</h1>
+        <h1 className="text-xl font-bold tracking-tight">Jarvis</h1>
       </div>
 
       <nav className="flex-1 px-4 space-y-2">

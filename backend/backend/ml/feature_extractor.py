@@ -9,34 +9,66 @@ PRODUCTIVE_APPS = ["Code", "VS Code", "PyCharm", "Terminal"]
 
 def extract_base_app(title: str) -> str:
     """
-    FIX: Extract base application name from window title.
+    Extract base application name from window title.
     e.g. 'file.py - Project - Visual Studio Code' -> 'Visual Studio Code'
-    Prevents tab/file switches from inflating app_switches count.
-    Must match the same logic used in app.py.
+
+    FIX: Normalise terminal and noisy system windows to stable names
+    to prevent app_switches inflating when cmd title changes each poll.
     """
-    if not title:
+    if not title or not title.strip():
         return "Unknown"
+
+    title_lower = title.lower()
+
+    if any(x in title_lower for x in [
+        "cmd.exe", "powershell", "windows powershell",
+        "command prompt", "terminal", "bash", "wsl"
+    ]):
+        return "Terminal"
+
+    if any(x in title_lower for x in [
+        "task switching", "snipping tool", "57% complete",
+        "cortana", "start menu",
+    ]):
+        return "System"
+
     parts = [p.strip() for p in title.split(" - ")]
-    return parts[-1] if parts else title
+    clean_parts = [p for p in parts if p and not (len(p) > 2 and p[1] == ":")]
+    return clean_parts[-1] if clean_parts else "Unknown"
 
 
-def extract_features():
+def extract_features(source_filter: str | None = None):
+    """
+    Extract features from the activity log.
 
+    Args:
+        source_filter: If 'pc' or 'phone', only process rows from that source.
+                       If None, process all rows (combined).
+
+    Returns list of: [screen_time, continuous_usage, night_usage,
+                      app_switches, breaks, productive_ratio]  (all in minutes)
+    """
     screen_time = 0
     night_usage = 0
     app_switches = 0
     breaks = 0
     productive_time = 0
 
-    last_base_app = None  # FIX: compare base app, not full window title
+    last_base_app = None
     last_time = None
     continuous_usage = 0
     current_streak = 0
 
-    with open(LOG_FILE, "r") as f:
+    with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
         reader = csv.DictReader(f)
 
         for row in reader:
+            # FIX: Filter by source if requested.
+            # Old logs without a 'source' column are treated as 'pc'.
+            row_source = row.get("source") or "pc"
+            if source_filter is not None and row_source != source_filter:
+                continue
+
             timestamp = datetime.fromisoformat(row["timestamp"])
             app = row["app"]
             duration = int(row["duration_seconds"])
@@ -44,24 +76,18 @@ def extract_features():
 
             screen_time += duration
 
-            # Night usage (10 PM to 6 AM)
             if timestamp.hour >= 22 or timestamp.hour <= 5:
                 night_usage += duration
 
-            # Productive apps
             if any(p in app for p in PRODUCTIVE_APPS):
                 productive_time += duration
 
-            # FIX: compare base_app to previous base_app (not full title),
-            # and only count switch if last_base_app is set (skip first row)
-            # to avoid the NaN phantom switch from the original code.
+            # FIX: Compare base app, skip first row (last_base_app is None)
             if last_base_app is not None and last_base_app != base_app:
                 app_switches += 1
 
-            # Breaks and continuous streak tracking
             if last_time:
-                # FIX: Use .total_seconds() — original used .seconds which
-                # caps at 86400 and returns wrong values for gaps > 1 day.
+                # FIX: Use .total_seconds() not .seconds
                 diff = (timestamp - last_time).total_seconds()
                 if diff > 300:
                     breaks += 1
@@ -79,7 +105,6 @@ def extract_features():
 
     productive_ratio = productive_time / screen_time if screen_time else 0
 
-    # Convert seconds to minutes to match the units used in app.py
     return [
         round(screen_time / 60, 2),
         round(continuous_usage / 60, 2),

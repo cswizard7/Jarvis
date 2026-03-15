@@ -1,3 +1,14 @@
+"""
+tracker.py — PC activity tracker.
+
+Now writes a 'source' column ('pc') to activity_log.csv so entries can be
+distinguished from phone entries written by phone_tracker.py.
+
+Run both trackers simultaneously in separate terminals:
+    python tracker.py        # terminal 1 — PC tracking
+    python phone_tracker.py  # terminal 2 — phone tracking (requires ADB)
+"""
+
 import time
 import csv
 import os
@@ -7,7 +18,7 @@ from datetime import datetime, timedelta
 LOG_FILE = os.path.join(os.path.dirname(__file__), "activity_log.csv")
 
 # How many days of history to keep in the log
-KEEP_DAYS = 5
+KEEP_DAYS = 7
 
 
 def trim_log():
@@ -18,8 +29,6 @@ def trim_log():
         df = pd.read_csv(LOG_FILE, encoding='utf-8', encoding_errors='ignore')
         if df.empty:
             return
-        # FIX: Use format='mixed' to handle varying timestamp formats
-        # (with/without microseconds) without raising ValueError.
         df["timestamp"] = pd.to_datetime(df["timestamp"], format='mixed')
         cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
         before = len(df)
@@ -37,7 +46,6 @@ def get_active_window():
         import pygetwindow as gw
         win = gw.getActiveWindow()
         if win and win.title:
-            # Replace any Unicode characters that can't be ASCII-encoded (e.g. emoji)
             safe_title = win.title.encode('ascii', errors='replace').decode('ascii')
             return safe_title
         return "Unknown"
@@ -45,18 +53,25 @@ def get_active_window():
         return "Unknown"
 
 
-def log_activity():
-    # Create file with headers if it doesn't exist
+def ensure_log_headers():
+    """
+    Create log file with headers if missing.
+    FIX: Added 'source' column. Existing logs without this column still load
+    fine — pandas fills missing columns with NaN, and app.py treats NaN
+    source as 'pc' via fillna('pc').
+    """
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="", encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "app", "duration_seconds"])
+            writer.writerow(["timestamp", "app", "duration_seconds", "source"])
         print(f"Created log file: {LOG_FILE}")
 
-    # Trim old data on startup
+
+def log_activity():
+    ensure_log_headers()
     trim_log()
 
-    print(f"Tracker running... keeping last {KEEP_DAYS} days of data.")
+    print(f"PC Tracker running... keeping last {KEEP_DAYS} days of data.")
     print(f"Logging to: {LOG_FILE}")
     print("Press Ctrl+C to stop.")
 
@@ -68,11 +83,11 @@ def log_activity():
 
         with open(LOG_FILE, "a", newline="", encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, app, 5])
+            # FIX: Write source='pc' so backend can separate PC vs phone rows
+            writer.writerow([timestamp, app, 5, "pc"])
 
-        print(f"{timestamp} | {app}")
+        print(f"{timestamp} | [pc] {app}")
 
-        # Trim once per day
         entry_count += 1
         if entry_count % 17280 == 0:
             trim_log()
